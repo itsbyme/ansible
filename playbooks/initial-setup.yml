@@ -1,0 +1,258 @@
+---
+- name: Initial setup of new hosts
+  hosts: all
+  gather_facts: true
+
+  vars_prompt:
+    - name: password
+      prompt: "Password for new sudo user"
+      private: true
+      confirm: true
+
+  vars:
+    username: itsbyme
+    home: "/home/{{ username }}"
+    usergroups:
+      - users
+      - sudo
+      - docker
+      - systemd-journal
+    usershell: /bin/zsh
+    password_hash_algorithm: sha512
+    hostname: "{{ inventory_hostname }}"
+    ssh_public_key: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519.pub"
+    packages_to_install:
+      - curl
+      - vim
+      - git
+      - sudo
+      - zsh
+      - docker.io
+      - docker-compose
+      - jq
+      - fail2ban
+      - btop
+
+    hosts_file:
+      path: /etc/hosts
+      ipv4:
+        regexp: '^127\.0\.0\.1\s'
+        line: "127.0.0.1  localhost"
+      ipv6:
+        regexp: '^::1\s'
+        line: "::1        localhost"
+      selfhost:
+        regexp: '^127\.0\.1\.1\s'
+        line: "127.0.1.1  {{ hostname }}"
+
+    fail2ban_config:
+      sshd_jail:
+        path: /etc/fail2ban/jail.d/sshd.local
+        content: |
+          [sshd]
+          enabled = true
+          port = ssh
+          logpath = %(sshd_log)s
+          backend = %(sshd_backend)s
+          maxretry = 3
+          findtime = 1h
+          bantime = 1d
+          ignoreip = 127.0.0.0/8 ::1
+
+    sshd_config:
+      path: /etc/ssh/sshd_config
+      marker: "# {mark} ANSIBLE MANAGED BLOCK: Include config.d"
+      include_command: Include /etc/ssh/sshd_config.d/*.conf
+      insert_before: "^[^#]"
+      validate_command: sshd -t -f %s
+      hardening:
+        path: "/etc/ssh/sshd_config.d/00-hardening.conf"
+        content: |
+          PermitRootLogin no
+          PasswordAuthentication no
+          PubkeyAuthentication yes
+          AuthorizedKeysFile .ssh/authorized_keys
+
+    vimrc:
+      url: https://raw.githubusercontent.com/itsbyme/dotfiles/refs/heads/master/vim/.vimrc
+      path: "{{ home }}/.vimrc"
+
+    ohmyzsh: 
+      url: https://github.com/ohmyzsh/ohmyzsh.git
+      path: "{{ home }}/.oh-my-zsh"
+      plugin:
+        path: "{{ home }}/.oh-my-zsh/custom/plugins"
+
+    zshrc:
+      url: https://raw.githubusercontent.com/itsbyme/dotfiles/refs/heads/master/zsh/.zshrc
+      path: "{{ home }}/.zshrc"
+
+    zsh_autosuggestions:
+      url: https://github.com/zsh-users/zsh-autosuggestions.git
+      path: "{{ ohmyzsh.plugin.path }}/zsh-autosuggestions"
+
+    zsh_syntax_highlighting:
+      url: https://github.com/zsh-users/zsh-syntax-highlighting.git
+      path: "{{ ohmyzsh.plugin.path }}/zsh-syntax-highlighting"
+
+  pre_tasks:
+    - name: Verify Debian family
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["os_family"] == "Debian"
+        fail_msg: "This playbook supports Debian-family systems only, detected {{ ansible_facts['distribution'] }}"
+
+    - name: Verify local public SSH key is exists
+      ansible.builtin.stat:
+        path: "{{ ssh_public_key }}"
+      delegate_to: localhost
+      register: local_public_key_file
+      run_once: true
+
+    - name: Stop if local public SSH key is absent
+      ansible.builtin.assert:
+        that:
+          - local_public_key_file.stat.exists
+          - local_public_key_file.stat.size | int > 0
+        fail_msg: "Public key {{ ssh_public_key }} is missing. Create it first"
+      run_once: true
+
+    - name: Show host configuration
+      ansible.builtin.debug:
+        msg:
+          - "Hostname: {{ hostname }}"
+          - "User: {{ username }}"
+          - "User groups: {{ usergroups }}"
+          - "User shell: {{ usershell }}"
+          - "Packages to install: {{ packages_to_install }}"
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+
+    - name: Upgrade all packages
+      ansible.builtin.apt:
+        upgrade: dist
+        autoremove: true
+    
+    - name: Install required packages
+      ansible.builtin.apt:
+        name: "{{ packages_to_install }}"
+        state: present
+
+    - name: Set system hostname
+      ansible.builtin.hostname:
+        name: "{{ hostname }}"
+
+    - name: Ensure localhost entires in hosts
+      ansible.builtin.lineinfile:
+        path: "{{ hosts_file.path }}"
+        regexp: "{{ hosts_file.ipv4.regexp }}"
+        line: "{{ hosts_file.ipv4.line }}"
+        state: present
+
+    - name: Ensure IPv6 localhost entry in hosts
+      ansible.builtin.lineinfile:
+        path: "{{hosts_file.path }}"
+        regexp: "{{ hosts_file.ipv6.regexp }}"
+        line: "{{ hosts_file.ipv6.line }}"
+        state: present
+
+    - name: Ensure hostname entry in hosts
+      ansible.builtin.lineinfile:
+        path: "{{ hosts_file.path }}"
+        regexp: "{{ hosts_file.selfhost.regexp }}"
+        line: "{{ hosts_file.selfhost.line }}"
+        state: present
+
+    - name: Reboot host after setup system
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+
+    - name:  Initialize user
+      ansible.builtin.user:
+        name: "{{ username }}"
+        groups: "{{ usergroups }}"
+        append: true
+        shell: "{{ usershell }}"
+        create_home: true
+        password: "{{ password | password_hash(password_hash_algorithm) }}"
+        update_password: always
+    
+    - name: Deploy SSH public key for user
+      ansible.posix.authorized_key:
+        user: "{{ username }}"
+        key: "{{ lookup('file', ssh_public_key) }}"
+        state: present
+
+    - block:
+      - name: Download .vimrc to user home
+        ansible.builtin.get_url:
+          url: "{{ vimrc.url }}"
+          dest: "{{ vimrc.path }}"
+  
+      - name: Clone Oh My Zsh
+        ansible.builtin.git:
+          repo: "{{ ohmyzsh.url }}"
+          dest: "{{ ohmyzsh.path }}"
+          version: master
+
+      - name: Download .zshrc to user home
+        ansible.builtin.get_url:
+          url: "{{ zshrc.url }}"
+          dest: "{{ zshrc.path }}"
+
+      - name: Clone zsh-autosuggestions plugin
+        ansible.builtin.git:
+          repo: "{{ zsh_autosuggestions.url }}"
+          dest: "{{ zsh_autosuggestions.path }}"
+          version: master
+  
+      - name: Clone zsh-syntax-highlighting plugin
+        ansible.builtin.git:
+          repo: "{{ zsh_syntax_highlighting.url }}"
+          dest: "{{ zsh_syntax_highlighting.path }}"
+          version: master
+  
+      become_user: "{{ username }}"
+
+    - name: Configure fail2ban SSH jail
+      ansible.builtin.copy:
+        dest: "{{ fail2ban_config.sshd_jail.path }}"
+        content: "{{ fail2ban_config.sshd_jail.content }}"
+        mode: "0644"
+        owner: root
+        group: root
+      notify: restart fail2ban
+      
+    - name: Ensure sshd_config has Include as first non-comment directive
+      ansible.builtin.blockinfile:
+        path: "{{ sshd_config.path }}"
+        marker: "{{ sshd_config.marker }}"
+        block: "{{ sshd_config.include_command }}"
+        insertbefore: "{{ sshd_config.insert_before }}"
+        state: present
+        validate: "{{ sshd_config.validate_command }}"
+
+    - name: Configure SSH hardening
+      ansible.builtin.copy:
+        dest: "{{ sshd_config.hardening.path }}"
+        content: "{{ sshd_config.hardening.content }}"
+        mode: "0644"
+        owner: root
+        group: root
+        validate: "{{ sshd_config.validate_command }}"
+      notify: restart sshd
+
+  handlers:
+    - name: restart fail2ban
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: restarted
+
+    - name: restart sshd
+      ansible.builtin.systemd:
+        name: sshd
+        state: restarted
